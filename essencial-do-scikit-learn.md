@@ -22,6 +22,7 @@
 11. [Template Mestre Ponta a Ponta (Código 100% Executável)](#11-template-mestre-ponta-a-ponta-código-100-executável)
 12. [Top 5 Armadilhas Comuns e Como Evitá-las](#12-top-5-armadilhas-comuns-e-como-evitá-las)
 13. [O Essencial de Feature Engineering (Além do Básico)](#13-o-essencial-de-feature-engineering-além-do-básico)
+14. [Implementando o Script de Inferência (`predict.py`)](#14-implementando-o-script-de-inferência-predictpy)
 
 ---
 
@@ -898,6 +899,152 @@ print(f"R²  : {r2_score(y_test, previsoes):.4f}")
 joblib.dump(pipeline_producao, "pipeline_completa.joblib")
 print("Pipeline salva com sucesso!")
 ```
+
+---
+
+## 14. Implementando o Script de Inferência (`predict.py`)
+
+No ciclo de vida de Machine Learning, a separação de responsabilidades é essencial:
+
+- **`train.py` (ou Jupyter Notebook):** Focado em experimentação, exploração dos dados históricos, definição dos pré-processadores (`ColumnTransformer`, imputers, scalers), treinamento dos estimadores, avaliação por validação cruzada e exportação do artefato final (`joblib.dump`).
+- **`predict.py`:** É o script de **inferência/produção**. Ele **não** retreina o modelo nem recalcula estatísticas (médias, medianas ou desvios). Sua única função é carregar o pipeline salvo, receber dados novos e cuspir o resultado com validação e segurança.
+
+### Os 4 Pilares de um `predict.py` Profissional
+
+1. **Carregamento Seguro com Cache (`@lru_cache`):** Carregar um arquivo `.joblib` a cada requisição é custoso em I/O. Criamos uma função `load_model()` com cache em memória para que o modelo fique carregado para chamadas subsequentes.
+2. **Suporte Dual (Unitário, Lote em Memória e Arquivo):**
+   - **`predict_single(...)`:** Recebe atributos de um único registro (útil para formulários, CLIs e endpoints HTTP pontuais).
+   - **`predict_batch(...)`:** Recebe dados em memória (`pd.DataFrame` ou `list[dict]` como payloads JSON de APIs), executando a inferência vetorizada diretamente na RAM, sem tocar no disco.
+   - **`predict_from_csv(...)`:** Utilitário dedicado de I/O para ler arquivos `.csv` do disco, delegar para `predict_batch` e opcionalmente exportar o resultado.
+3. **Caminhos Robustos (`pathlib.Path`):** Usar resolução dinâmica de caminhos (`Path(__file__).resolve().parent...`) garante que o script funcione perfeitamente seja executado da raiz do projeto, da pasta `src/` ou de outro diretório.
+4. **Interface CLI Flexível (`argparse`):** Permitir tanto a passagem de argumentos pela linha de comando (`--area 75`) quanto o modo interativo pelo terminal caso o usuário execute sem flags.
+
+### Estrutura do `src/scikitlearn/predict.py`
+
+O script está implementado em [`src/scikitlearn/predict.py`](file:///home/jos/Desktop/Ciência de Dados/03_Aprendendo_Scikit_Learn/src/scikitlearn/predict.py). As principais funções são:
+
+```python
+import argparse
+from functools import lru_cache
+from pathlib import Path
+import joblib
+import pandas as pd
+
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
+DEFAULT_MODEL_PATH = BASE_DIR / "models" / "essencial-do-scikit-learn.joblib"
+REQUIRED_COLUMNS = ["Area", "Quartos", "Banheiros", "Tem_Garagem"]
+
+@lru_cache(maxsize=1)
+def load_model(model_path: Path | str | None = None):
+    """Carrega o pipeline serializado com cache em memória."""
+    path = Path(model_path) if model_path else DEFAULT_MODEL_PATH
+    if not path.exists():
+        raise FileNotFoundError(f"Modelo não encontrado em: '{path}'")
+    return joblib.load(path)
+
+def predict_single(area, quartos, banheiros, tem_garagem="Sim", model=None) -> float:
+    """Predição para um único imóvel."""
+    if model is None:
+        model = load_model()
+  
+    # Criamos o DataFrame exatamente com os nomes de colunas que o Pipeline espera
+    input_data = pd.DataFrame([{
+        "Area": area,
+        "Quartos": quartos,
+        "Banheiros": banheiros,
+        "Tem_Garagem": tem_garagem,
+    }])
+    return float(model.predict(input_data)[0])
+
+def predict_batch(data: pd.DataFrame | list[dict], model=None, as_dataframe: bool = True) -> pd.DataFrame | list[float]:
+    """Predição em lote (batch) para múltiplos registros em memória (DataFrame ou lista de dicts)."""
+    if model is None:
+        model = load_model()
+  
+    df = pd.DataFrame(data) if isinstance(data, list) else data.copy()
+    missing_cols = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Faltam colunas obrigatórias: {missing_cols}")
+  
+    preds = model.predict(df[REQUIRED_COLUMNS])
+    if not as_dataframe:
+        return [float(p) for p in preds]
+    df["Valor_Predito"] = preds
+    return df
+
+def predict_from_csv(input_csv_path, output_csv_path=None, model=None) -> pd.DataFrame:
+    """Utilitário de I/O: Lê CSV do disco, executa predição em lote e opcionalmente exporta."""
+    df = pd.read_csv(input_csv_path)
+    result_df = predict_batch(df, model=model, as_dataframe=True)
+    if output_csv_path:
+        result_df.to_csv(output_csv_path, index=False)
+    return result_df
+```
+
+### Exemplos de Uso
+
+#### 1. Via Linha de Comando (CLI Rápida)
+
+```bash
+uv run predict --area 75 --quartos 3 --banheiros 2 --garagem Sim
+# Retorno: Valor estimado do imóvel: R$ 425,916.22
+```
+
+#### 2. Em Lote a Partir de Arquivo CSV
+
+```bash
+uv run predict --batch dataset/raw/novas_casas_exemplo.csv --output dataset/raw/previsoes.csv
+```
+
+#### 3. Modo Interativo
+
+Se rodar sem argumentos, ele inicia um assistente interativo no terminal:
+
+```bash
+uv run predict
+```
+
+#### 4. Importando em uma API (ex: FastAPI)
+
+Como `predict_single` e `predict_batch` operam diretamente em memória com tipos nativos e dicionários, plugar em rotas individuais ou em lote no FastAPI é imediato:
+
+```python
+from fastapi import FastAPI
+from pydantic import BaseModel
+from scikitlearn import predict_single, predict_batch
+
+app = FastAPI(title="API de Avaliação de Imóveis")
+
+class ImovelInput(BaseModel):
+    area: float
+    quartos: float
+    banheiros: float
+    tem_garagem: str = "Sim"
+
+@app.post("/predict")
+def prever_unico(imovel: ImovelInput):
+    valor = predict_single(
+        area=imovel.area,
+        quartos=imovel.quartos,
+        banheiros=imovel.banheiros,
+        tem_garagem=imovel.tem_garagem
+    )
+    return {"valor_estimado": round(valor, 2)}
+
+@app.post("/predict/batch")
+def prever_lote(imoveis: list[ImovelInput]):
+    # Converte a lista Pydantic em lista de dicts e passa direto em memória
+    dados = [item.model_dump(by_alias=False) for item in imoveis]
+    # Mapeia chaves para as esperadas pelo modelo se necessário
+    dados_formatados = [
+        {"Area": d["area"], "Quartos": d["quartos"], "Banheiros": d["banheiros"], "Tem_Garagem": d["tem_garagem"]}
+        for d in dados
+    ]
+    previsoes = predict_batch(dados_formatados, as_dataframe=False)
+    return {"previsoes": previsoes}
+```
+
+---
 
 ## 🎯 Resumo Rápido para Consulta
 
